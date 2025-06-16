@@ -32,23 +32,13 @@ def parse_selection(input_str, max_index):
             indices.add(int(token))
     return sorted(i for i in indices if 0 <= i < max_index)
 
-def calculate_required_pages(selection_str, episodes_per_page):
-    max_ep = 0
-    for token in selection_str.split(","):
-        token = token.strip()
-        if "-" in token:
-            _, end = map(int, token.split("-"))
-            max_ep = max(max_ep, end)
-        else:
-            max_ep = max(max_ep, int(token))
-    return (max_ep - 1) // episodes_per_page + 1
 
 def save_download_links(anime_name, links, folder):
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"{anime_name}_download_links.json")
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(links, f, indent=2)
-    print(f"[✓] Saved all links to {filename}")
+    print(f"\n\tSaved all links to {filename}")
 
 # -------------------- Selenium/BeautifulSoup Scrapers --------------------
 
@@ -80,32 +70,66 @@ def scrape_episodes(url):
     try:
         driver.get(url)
 
+        # Get anime name
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "anime-header")))
+        header = driver.find_element(By.CLASS_NAME, "anime-header")
+        raw_title = header.find_element(By.TAG_NAME, "h1").text.strip()
+        anime_name = raw_title.splitlines()[0].strip()
+
+
+        # Click download tab to reveal episode links
         WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "label.btn.btn-dark.btn-sm"))
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "label.btn.btn-dark.btn-sm"))
         ).click()
+
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "a[href^='/play/']"))
         )
 
         while True:
+            WebDriverWait(driver, 10).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, "a[href^='/play/']")) > 0
+            )
+            time.sleep(1)  # let JS settle
+
             soup = BeautifulSoup(driver.page_source, "html.parser")
-            episodes = [(a.text.strip(), f"https://animepahe.ru{a['href']}") for a in soup.select("a[href^='/play/']")]
+            episode_links = soup.select("a[href^='/play/']")
+            
+            if not episode_links:
+                break  # no episodes found
+
+            # Track to detect pagination stall
+            current_first_text = episode_links[0].text.strip()
+            if 'last_seen_text' in locals() and current_first_text == last_seen_text:
+                print("[-] Episode list didn't change, breaking pagination loop.")
+                break
+
+            episodes = [(a.text.strip(), f"https://animepahe.ru{a['href']}") for a in episode_links]
             all_episodes.extend(episodes)
 
+            last_seen_text = current_first_text  # update after checking
+
             try:
-                a_element = driver.find_element(By.CSS_SELECTOR, "a.page-link.next-page")
-                li_element = a_element.find_element(By.XPATH, "..")
-                li_class = li_element.get_attribute("class")
-                if "disabled" in li_class:
+                try:
+                    page_nav = driver.find_element(By.CSS_SELECTOR, "nav[aria-label='Page navigation']")
+                except Exception:
                     break
-                a_element.click()
-                WebDriverWait(driver, 10).until(EC.staleness_of(a_element))
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "a[href^='/play/']"))
-                )
+                
+                next_btn = page_nav.find_element(By.CSS_SELECTOR, "a.page-link.next-page")
+                li_parent = next_btn.find_element(By.XPATH, "..")
+                if "disabled" in li_parent.get_attribute("class"):
+                    break
+
+                next_btn.click()
+                time.sleep(1)  # give time to switch pages
             except Exception as e:
-                print(f"[-] Error navigating to next page: {e}")
+                print(f"[-] Done or failed to go next: {e}")
                 break
+
+
+
+    except Exception as e:
+        print(f"[-] Error scraping: {e}")
     finally:
         driver.quit()
 
@@ -116,37 +140,16 @@ def scrape_episodes(url):
         if url not in seen:
             seen.add(url)
             unique_episodes.append((title, url))
-    return list(reversed(unique_episodes))
+    
+    return list(reversed(unique_episodes)), anime_name
 
 
-
-
-
-
-def find_anime_name(url):
+def extract_download_link(url, preferred_quality="1080p"):
     options = uc.ChromeOptions()
     options.headless = True
     driver = uc.Chrome(options=options)
     try:
         driver.get(url)
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "anime-header")))
-        header = driver.find_element(By.CLASS_NAME, "anime-header")
-        div = header.find_element(By.TAG_NAME, "div")
-        h1 = div.find_element(By.TAG_NAME, "h1")
-        span = h1.find_element(By.TAG_NAME, "span")
-        return span.text
-    except Exception as e:
-        print(f"[-] Error finding anime name: {e}")
-        return input("Enter anime name: ")
-    finally:
-        driver.quit()
-
-def extract_download_link(play_url, preferred_quality="1080p"):
-    options = uc.ChromeOptions()
-    options.headless = True
-    driver = uc.Chrome(options=options)
-    try:
-        driver.get(play_url)
         WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "downloadMenu"))).click()
         time.sleep(2)
         soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -178,7 +181,6 @@ def resolve_final_kwik_link(url):
             href = kwik_link.get_attribute("href")
             if kwik_link:
                 kwik_link.click()
-                print("[+] Download button clicked, waiting for redirection...")
                 break
             else:
                 driver.refresh()
@@ -200,6 +202,8 @@ def extract_final_download_link(url):
         ).click()
         print("[+] Download button clicked, waiting for GET request")
         time.sleep(2)
+
+        episode_count = 1
         for entry in driver.get_log("performance"):
             msg = entry.get("message")
             if not msg:
@@ -209,8 +213,10 @@ def extract_final_download_link(url):
                 params = msg_json.get("message", {}).get("params", {})
                 request = params.get("request", {})
                 url = request.get("url", "")
-                if url.startswith("https://eu") and ".mp4" in url:
+                if url.startswith("https://") and ".mp4" in url:
                     download_url = url
+                    print(f"[✓] Found download URL for episode: {episode_count}")
+                    episode_count += 1
                     break
             except Exception:
                 continue
@@ -227,7 +233,7 @@ def download_video(url, anime_name, ep_num, folder, retries=3, delay=5):
     full_path = os.path.join(folder, filename)
 
     for attempt in range(1, retries + 1):
-        print(f"[+] Attempt {attempt} to download {filename}")
+        print(f"Attempt {attempt} to download {filename}")
         try:
             with requests.get(url, stream=True, timeout=20) as r:
                 r.raise_for_status()
@@ -259,6 +265,16 @@ def download_from_saved_links(anime_name, folder):
         tqdm.write(f"[→] EP{ep_num}")
         download_video(url, anime_name, ep_num, folder)
 
+
+
+def sanitize_name(name):
+    # Remove control characters and invalid file path characters
+    name = name.strip()
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]', '', name)
+    name = re.sub(r'\s+', ' ', name)  # collapse multiple spaces
+    return name
+
+
 # -------------------- Main Script --------------------
 def main():
     print("""
@@ -279,19 +295,28 @@ def main():
         if not input_url:
             print("[-] Failed to resolve URL.")
             exit(1)
+    
 
     # Scrape all episodes first
-    episodes = scrape_episodes(input_url)
-
+    episodes, anime_name = scrape_episodes(input_url)
+    # Center the anime name in the terminal
+    if hasattr(anime_name, 'text'):
+        anime_name_str = anime_name.text.strip()
+    else:
+        anime_name_str = str(anime_name).strip()
+    terminal_width = os.get_terminal_size().columns
+    print(f"{anime_name_str.center(terminal_width)}")
+    
     total_eps = len(episodes)
+
     if not episodes:
-        print("[-] No episodes found.")
+        print("[-] No episodes found")
         exit(1)
 
-    print(f"[✓] Total episodes found: {total_eps}")
+    print(f"\tTotal episodes found: {total_eps}")
 
     # Now prompt for selection
-    selection = input("Select episodes (e.g. 1-30,90): ").strip()
+    selection = input("\tSelect episodes (1-30, 90): ").strip()
     selected_indices = [i - 1 for i in parse_selection(selection, total_eps)]
 
 
@@ -318,9 +343,12 @@ def main():
             "url": download_url
         })
 
-    anime_name = find_anime_name(input_url)
-    save_download_links(anime_name, download_links, download_dir)
-    download_from_saved_links(anime_name, download_dir)
+    sanitized_name = sanitize_name(anime_name_str)
+
+    save_download_links(sanitized_name, download_links, download_dir)
+    download_from_saved_links(sanitized_name, download_dir)
+
+
 
 if __name__ == '__main__':
     main()
